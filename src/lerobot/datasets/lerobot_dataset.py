@@ -21,6 +21,7 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
+import subprocess
 import datasets
 import numpy as np
 import packaging.version
@@ -540,13 +541,64 @@ class LeRobotDatasetMetadata:
         return obj
 
 
-def _encode_video_worker(video_key: str, episode_index: int, root: Path, fps: int) -> Path:
+def _cpu_encode_video_worker(video_key: str, episode_index: int, root: Path, fps: int) -> Path:
     temp_path = Path(tempfile.mkdtemp(dir=root)) / f"{video_key}_{episode_index:03d}.mp4"
     fpath = DEFAULT_IMAGE_PATH.format(image_key=video_key, episode_index=episode_index, frame_index=0)
     img_dir = (root / fpath).parent
     encode_video_frames(img_dir, temp_path, fps, overwrite=True)
     shutil.rmtree(img_dir)
     return temp_path
+
+def _encode_video_worker(video_key: str, episode_index: int, root: Path, fps: int) -> Path:
+    temp_path = Path(tempfile.mkdtemp(dir=root)) / f"{video_key}_{episode_index:03d}.mp4"
+    
+    # 이미지 디렉토리 경로 계산
+    fpath = DEFAULT_IMAGE_PATH.format(image_key=video_key, episode_index=episode_index, frame_index=0)
+    img_dir = (root / fpath).parent
+    
+    # LeRobot의 기본 이미지 저장 패턴 (frame_000000.png, frame_000001.png ...)
+    input_pattern = img_dir / "frame_%06d.png"
+
+    # H100 GPU 가속을 위한 FFmpeg 명령어 구성
+    cmd = [
+        "ffmpeg",
+        "-y",                  # 덮어쓰기 허용
+        "-framerate", str(fps),
+        "-f", "image2",
+        "-i", str(input_pattern),
+        
+        # --- GPU 인코딩 설정 (H100 최적화) ---
+        "-c:v", "h264_nvenc",  # NVIDIA 하드웨어 인코더 사용
+        "-preset", "p6",       # 프리셋: p1(빠름) ~ p7(고품질). H100은 p6 권장
+        "-tune", "hq",         # 화질 우선 튜닝
+        "-rc", "vbr",          # 가변 비트레이트
+        "-cq", "19",           # 품질 수준 (19~23 권장, 낮을수록 고화질)
+        "-b:v", "0",           # cq 모드 사용 시 비트레이트 0 설정
+        
+        # --- 호환성 설정 (필수) ---
+        "-pix_fmt", "yuv420p", # CPU 디코더 및 PyTorch 호환성을 위해 필수
+        
+        str(temp_path)
+    ]
+
+    try:
+        # FFmpeg 실행 (로그는 에러 발생 시에만 확인하도록 설정)
+        subprocess.run(
+            cmd, 
+            check=True, 
+            stdout=subprocess.DEVNULL, 
+            stderr=subprocess.PIPE
+        )
+    except subprocess.CalledProcessError as e:
+        error_msg = e.stderr.decode() if e.stderr else "Unknown error"
+        logging.error(f"GPU Encoding failed for {video_key}: {error_msg}")
+        # 실패 시 CPU 방식으로 폴백하거나 에러 발생 (여기선 에러 발생)
+        raise e
+
+    # 원본 이미지 디렉토리 삭제
+    shutil.rmtree(img_dir)
+    return temp_path
+
 
 
 class LeRobotDataset(torch.utils.data.Dataset):
